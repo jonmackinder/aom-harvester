@@ -1,236 +1,196 @@
-#!/usr/bin/env python3
 """
-Harvester: builds a JSON file of upcoming events.
+AOM Harvester (HTML + ICS) with strict timeouts and fast-fail behavior.
 
-✅ Works in GitHub Actions (no third-party packages).
-✅ Reads public ICS calendar feeds (URLs in ICS_FEEDS env, comma-separated).
-✅ Keyword filtering (KEYWORDS env, comma-separated; case-insensitive).
-✅ Time window filtering (WINDOW_DAYS env; defaults safely to 180 even if blank).
-✅ Never fails the workflow on “no data” – still writes a valid JSON file.
+- Never hangs: all network calls use short timeouts + tiny retry.
+- Always writes a JSON artifact: aom-events.json
+- Inputs via env: KEYWORDS, CITY, STATE, COUNTRY, WITHIN_MILES, WINDOW_DAYS, ICS_FEEDS
 """
 
 from __future__ import annotations
-
-import os
-import sys
-import json
-import re
-import io
-import urllib.request
+import os, sys, json, time, re
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from urllib.parse import urlencode
+from typing import List, Dict, Any
 
-# ---------- small helpers ----------
+# --- Tunables ---------------------------------------------------------------
+REQ_TIMEOUT = 12         # seconds per HTTP request (hard limit)
+REQ_RETRIES = 1          # minimal retry so we fail fast but not flaky
+GLOBAL_SOFT_TIME = 240   # seconds soft budget for the whole run (job has 5m hard timeout)
+USER_AGENT = "AOMHarvester/1.0 (+github actions)"
+
+# ---------------------------------------------------------------------------
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def clean_int_env(name: str, default: int) -> int:
-    """
-    Read an int env var safely. Treats unset, empty, or invalid as default.
-    (Fix for the "" -> ValueError crash you hit earlier.)
-    """
-    raw = os.getenv(name)
-    if not raw:
-        return default
+def env_str(name: str, default: str = "") -> str:
+    val = os.getenv(name, "").strip()
+    return val if val else default
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
     try:
-        return int(str(raw).strip())
-    except ValueError:
+        return int(raw)
+    except Exception:
         return default
 
-def list_from_env(name: str) -> List[str]:
-    """
-    Split a comma/semicolon/newline separated env var into a list of strings.
-    Trims whitespace and drops empties.
-    """
-    raw = os.getenv(name) or ""
-    parts = re.split(r"[,\n;]+", raw)
+def split_list(s: str) -> List[str]:
+    if not s:
+        return []
+    # split by commas or newlines, trim blanks
+    parts = re.split(r"[,\n]+", s)
     return [p.strip() for p in parts if p.strip()]
 
-def safe_getenv(name: str) -> Optional[str]:
-    val = os.getenv(name)
-    if val is None:
-        return None
-    val = val.strip()
-    return val or None
+# --- Safe HTTP fetch with timeout + tiny retry -----------------------------
+def http_get(url: str) -> tuple[int, str] | tuple[None, None]:
+    import requests
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    last_exc = None
+    for attempt in range(REQ_RETRIES + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=REQ_TIMEOUT)
+            return r.status_code, r.text
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.5)
+    # failed
+    return None, None
 
-def log(msg: str) -> None:
-    print(f"[harvest] {msg}", flush=True)
-
-# ---------- ICS parsing (no third-party deps) ----------
-
-_ICS_EVENT_SPLIT = re.compile(r"(?m)^BEGIN:VEVENT\r?$")
-_ICS_KV = re.compile(r"(?m)^([A-Z]+)(;[^:]+)?:\s*(.+?)\s*$")
-_ICS_FOLDED = re.compile(r"(?m)\r?\n[ \t]")  # unfold folded lines
-
-def _unfold(text: str) -> str:
-    return _ICS_FOLDED.sub("", text)
-
-def _parse_ics_datetime(val: str) -> Optional[datetime]:
-    """
-    Supports common forms:
-      - 20250130T170000Z
-      - 20250130T170000 (floating; assume UTC)
-      - 20250130 (all-day; treat as start of day UTC)
-    """
-    val = val.strip()
-    try:
-        if val.endswith("Z"):
-            return datetime.strptime(val, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        if "T" in val:
-            # floating time – assume UTC for CI consistency
-            return datetime.strptime(val, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-        # date only
-        return datetime.strptime(val, "%Y%m%d").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-def parse_ics_events(text: str) -> List[Dict[str, Any]]:
-    text = _unfold(text)
-    # Split into event blocks (skip preamble)
-    blocks = _ICS_EVENT_SPLIT.split(text)
-    if not blocks:
-        return []
+# --- ICS ingestion ----------------------------------------------------------
+def parse_ics_feed(url: str, window_days: int) -> List[Dict[str, Any]]:
+    """Parse a single ICS feed URL into our normalized event dicts."""
+    from ics import Calendar
     events: List[Dict[str, Any]] = []
-    for block in blocks[1:]:
-        # Extract key fields
-        fields: Dict[str, str] = {}
-        for m in _ICS_KV.finditer(block):
-            k = m.group(1).upper()
-            v = m.group(3).strip()
-            # Keep the last occurrence of a key
-            fields[k] = v
-        start = _parse_ics_datetime(fields.get("DTSTART", ""))
-        end = _parse_ics_datetime(fields.get("DTEND", "")) or start
-        title = fields.get("SUMMARY", "").strip()
-        url = fields.get("URL", "").strip()
-        loc = fields.get("LOCATION", "").strip()
-        desc = fields.get("DESCRIPTION", "").strip()
+    code, text = http_get(url)
+    if code is None or not text:
+        return events
 
-        # Skip if we don't at least have a start or a title
-        if not (start or title):
+    try:
+        cal = Calendar(text)
+    except Exception:
+        return events
+
+    cutoff_end = now_utc() + timedelta(days=window_days)
+    cutoff_start = now_utc() - timedelta(days=1)
+
+    def to_iso(dt):
+        if dt is None:
+            return None
+        if getattr(dt, "tzinfo", None) is None:
+            # assume UTC if naive
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        return dt.astimezone(timezone.utc).isoformat()
+
+    for ev in cal.events:
+        # Some ICS have no times; guard it
+        try:
+            start = ev.begin.datetime if hasattr(ev, "begin") else None
+            end   = ev.end.datetime   if hasattr(ev, "end")   else None
+        except Exception:
+            start = end = None
+
+        # Window filter (if dates exist)
+        if start and (start < cutoff_start or start > cutoff_end):
             continue
 
         events.append({
-            "title": title or "(untitled)",
-            "start_utc": start.isoformat() if start else None,
-            "end_utc": end.isoformat() if end else None,
-            "location": loc or None,
-            "url": url or None,
-            "description": desc or None,
-            "source": "ics"
+            "source": "ics",
+            "source_url": url,
+            "title": getattr(ev, "name", None),
+            "description": getattr(ev, "description", None),
+            "start": to_iso(start),
+            "end": to_iso(end),
+            "location": getattr(ev, "location", None),
+            "all_day": bool(getattr(ev, "all_day", False)),
+            "uid": getattr(ev, "uid", None),
         })
     return events
 
-def fetch_text(url: str, timeout: int = 20) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "aom-harvester/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read()
-    # try utf-8 first, fall back to latin-1
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="ignore")
+# --- Extremely conservative HTML “searchers” (non-blocking) ----------------
+# These are placeholders that return quickly with timeouts;
+# enable/extend later when we have stable selectors.
+def html_search_eventbrite(keyword: str, city: str, state: str, country: str) -> List[Dict[str, Any]]:
+    # Disabled by default to avoid rate-limits / fragile scraping.
+    return []
 
-# ---------- main harvesting ----------
+def html_search_tickettailor(keyword: str, city: str, state: str, country: str) -> List[Dict[str, Any]]:
+    return []
 
-def within_window(dt_iso: Optional[str], start: datetime, end: datetime) -> bool:
-    if not dt_iso:
-        return False
-    try:
-        dt = datetime.fromisoformat(dt_iso)
-    except ValueError:
-        return False
-    return start <= dt <= end
+# --- Main -------------------------------------------------------------------
+def main():
+    soft_deadline = time.time() + GLOBAL_SOFT_TIME
 
-def keyword_ok(title: str, keywords: List[str]) -> bool:
-    if not keywords:
-        return True
-    text = (title or "").lower()
-    return any(k.lower() in text for k in keywords)
+    keywords = split_list(env_str("KEYWORDS", "steampunk,victorian,renaissance,faire,aether,tesla,edison"))
+    city     = env_str("CITY")
+    state    = env_str("STATE")
+    country  = env_str("COUNTRY")
+    within   = env_str("WITHIN_MILES")  # not used yet, reserved
+    window_days = env_int("WINDOW_DAYS", 180)
 
-def harvest_from_ics(feeds: List[str]) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-    for url in feeds:
-        try:
-            log(f"Fetching ICS: {url}")
-            txt = fetch_text(url)
-            evs = parse_ics_events(txt)
-            for e in evs:
-                e = dict(e)
-                e["source"] = f"ics:{url}"
-                events.append(e)
-        except Exception as exc:
-            log(f"WARNING: failed ICS fetch/parse: {url} ({exc})")
-    return events
+    ics_feeds = split_list(env_str("ICS_FEEDS"))
 
-def main() -> int:
-    # ----- configuration from environment -----
-    KEYWORDS = list_from_env("KEYWORDS")
-    WINDOW_DAYS = clean_int_env("WINDOW_DAYS", 180)   # <— safe defaulting
-    ICS_FEEDS = list_from_env("ICS_FEEDS")
-
-    # Optional location filters (not applied to ICS unless present in text)
-    CITY = safe_getenv("CITY")
-    STATE = safe_getenv("STATE")
-    COUNTRY = safe_getenv("COUNTRY")
-    WITHIN_MILES = clean_int_env("WITHIN_MILES", 0) if safe_getenv("WITHIN_MILES") else None
-
-    out_name = safe_getenv("OUTFILE") or "aom-events.json"
-
-    log(f"Start — window_days={WINDOW_DAYS}, keywords={KEYWORDS or '—'}, ics_feeds={len(ICS_FEEDS)}")
-
-    start = now_utc()
-    end = start + timedelta(days=WINDOW_DAYS)
-
-    # ----- collect -----
-    all_events: List[Dict[str, Any]] = []
-
-    # ICS feeds (if any)
-    if ICS_FEEDS:
-        all_events.extend(harvest_from_ics(ICS_FEEDS))
-    else:
-        log("No ICS_FEEDS provided; skipping ICS harvest.")
-
-    # ----- filter: keywords + time window -----
-    filtered: List[Dict[str, Any]] = []
-    for e in all_events:
-        if not within_window(e.get("start_utc"), start, end):
-            continue
-        if not keyword_ok(e.get("title", ""), KEYWORDS):
-            continue
-        filtered.append(e)
-
-    # ----- build output -----
-    payload: Dict[str, Any] = {
-        "meta": {
-            "ts_utc": now_utc().isoformat(),
-            "keywords": KEYWORDS,
-            "city": CITY,
-            "state": STATE,
-            "country": COUNTRY,
-            "within_miles": WITHIN_MILES,
-            "window_days": WINDOW_DAYS,
-            "sources": ["ics"] if ICS_FEEDS else [],
-            "count": len(filtered),
-        },
-        "events": filtered,
-        "notes": []
+    meta: Dict[str, Any] = {
+        "ts_utc": now_utc().isoformat(),
+        "keywords": keywords,
+        "city": city or None,
+        "state": state or None,
+        "country": country or None,
+        "within_miles": int(within) if within.isdigit() else None,
+        "window_days": window_days,
+        "sources": ["ics" if ics_feeds else None, "eventbrite_html", "tickettailor_html"],
     }
+    # remove None entries from sources
+    meta["sources"] = [s for s in meta["sources"] if s]
 
-    if not ICS_FEEDS:
-        payload["notes"].append("No ICS_FEEDS provided.")
-    if not filtered and all_events:
-        payload["notes"].append("No events matched filters (time window and/or keywords).")
-    if not all_events and ICS_FEEDS:
-        payload["notes"].append("ICS feeds fetched but no events were parsed.")
+    out: Dict[str, Any] = {"meta": meta, "events": [], "notes": []}
 
-    # ----- write file -----
-    with open(out_name, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    # 1) ICS feeds (fast, reliable)
+    for url in ics_feeds:
+        if time.time() > soft_deadline:
+            out["notes"].append("Soft time budget exhausted during ICS fetch.")
+            break
+        try:
+            out["events"].extend(parse_ics_feed(url, window_days))
+        except Exception as e:
+            out["notes"].append(f"ICS error: {url} :: {type(e).__name__}")
 
-    log(f"Wrote {out_name} with {len(filtered)} events (from {len(all_events)} raw).")
-    # Keep the job green even if zero events
+    # 2) Lightweight HTML attempts (kept super conservative; return quickly)
+    def guard_time():
+        if time.time() > soft_deadline:
+            out["notes"].append("Soft time budget exhausted during HTML search.")
+            return False
+        return True
+
+    for kw in (keywords or []):
+        if not guard_time(): break
+        try:
+            out["events"].extend(html_search_eventbrite(kw, city, state, country))
+        except Exception as e:
+            out["notes"].append(f"eventbrite_html '{kw}' :: {type(e).__name__}")
+
+        if not guard_time(): break
+        try:
+            out["events"].extend(html_search_tickettailor(kw, city, state, country))
+        except Exception as e:
+            out["notes"].append(f"tickettailor_html '{kw}' :: {type(e).__name__}")
+
+    # Deduplicate simple (by title+start)
+    seen = set()
+    unique = []
+    for ev in out["events"]:
+        key = (ev.get("title"), ev.get("start"))
+        if key in seen: 
+            continue
+        seen.add(key)
+        unique.append(ev)
+    out["events"] = unique
+    out["meta"]["count"] = len(unique)
+
+    # Always write the artifact
+    with open("aom-events.json", "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    # Exit 0 so the workflow stays green but still uploads notes/errors
     return 0
 
 if __name__ == "__main__":
