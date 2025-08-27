@@ -1,6 +1,6 @@
 """
 Eventbrite → events.json (robust, phone-friendly)
-- Reads EVENTBRITE_TOKEN (secret) and optional inputs via env
+- Reads EVENTBRITE_TOKEN (secret) + optional inputs via env
 - NEVER leaves CI without an events.json
 - ALWAYS exits 0 (so your workflow stays green)
 - Prints a one-line SUMMARY in the logs
@@ -13,7 +13,6 @@ from urllib.parse import urlencode
 try:
     import requests
 except Exception as e:
-    # Let the workflow install deps; just surface a clear message if import failed
     print("Bootstrap import error:", e)
 
 BASE = "https://www.eventbriteapi.com/v3/events/search/"
@@ -52,8 +51,7 @@ def search_events(token, keywords, city=None, within_miles=None, start_window_da
         events = data.get("events", [])
         all_events.extend(events)
 
-        pagination = data.get("pagination", {})
-        if not pagination.get("has_more_items"):
+        if not data.get("pagination", {}).get("has_more_items"):
             break
         q["page"] += 1
         time.sleep(0.25)
@@ -83,7 +81,6 @@ def main():
         "events": []
     }
 
-    # If the token is missing, don’t crash—write an informative file.
     if not token:
         msg = "Missing EVENTBRITE_TOKEN; writing empty events.json."
         print("WARN:", msg)
@@ -104,12 +101,11 @@ def main():
         print("SUMMARY:", json.dumps({"found": len(events), **result["meta"]}))
         return 0
     except Exception as e:
-        # Never leave CI without a file; embed the error for debugging.
         result["error"] = str(e)
         write_json(result)
         print("ERROR:", e)
         print("SUMMARY:", json.dumps({"found": 0, **result["meta"], "error": str(e)}))
-        return 0  # always exit 0 so GitHub Actions shows green
+        return 0  # keep Actions green
 
 if __name__ == "__main__":
     sys.exit(main())
