@@ -25,6 +25,13 @@ jobs:
           echo "Starting harvester..."
           python harvest.py || echo "Script failed but continuing"
           echo "Harvester finished."
+  - name: Upload events.json (always)
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: events-json
+      path: events.json
+      if-no-files-found: warn
 
       - name: Always succeed
         run: exit 0
