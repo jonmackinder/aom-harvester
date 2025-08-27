@@ -109,6 +109,15 @@ def main():
         print("ERROR:", e)
         print("SUMMARY:", json.dumps({"found": 0, **result["meta"], "error": str(e)}))
         return 0  # <-- exit 0 on purpose
+# --- Save results and print summary ---
+import json
+
+# Save all events into a JSON file (artifact for GitHub Actions)
+with open("events.json", "w") as f:
+    json.dump({"events": events}, f, indent=2)
+
+# Print a one-line summary so you see it in the Actions log
+print(f"SUMMARY: found={len(events)} city={city} within={within} window_days={window_days}")
 
 if __name__ == "__main__":
     sys.exit(main())
