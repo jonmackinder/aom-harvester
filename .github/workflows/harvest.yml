@@ -1,52 +1,11 @@
-name: Harvest AOM Events (Eventbrite JSON)
-
-on:
-  workflow_dispatch:
-    inputs:
-      city:
-        description: "City (optional, e.g., Los Angeles)"
-        required: false
-      within_miles:
-        description: "Radius in miles (optional, e.g., 75)"
-        required: false
-      keywords:
-        description: "Override keywords (space-separated)"
-        required: false
-      window_days:
-        description: "Days ahead to search (default 150)"
-        required: false
-
-jobs:
-  run-harvest:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Run harvester
-        env:
-          EVENTBRITE_TOKEN: ${{ secrets.EVENTBRITE_TOKEN }}
-          AOM_CITY: ${{ github.event.inputs.city }}
-          AOM_WITHIN_MILES: ${{ github.event.inputs.within_miles }}
-          AOM_KEYWORDS: ${{ github.event.inputs.keywords }}
-          AOM_WINDOW_DAYS: ${{ github.event.inputs.window_days }}
-        run: |
-          python harvest.py
-
-      - name: Upload events.json (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: events-json
-          path: events.json
-          if-no-files-found: warn
+- name: Run harvester
+  env:
+    EVENTBRITE_TOKEN: ${{ secrets.EVENTBRITE_TOKEN }}
+    AOM_CITY: ${{ github.event.inputs.city }}
+    AOM_WITHIN_MILES: ${{ github.event.inputs.within_miles }}
+    AOM_KEYWORDS: ${{ github.event.inputs.keywords }}
+    AOM_WINDOW_DAYS: ${{ github.event.inputs.window_days }}
+  run: |
+    set -e
+    echo "Running harvester with city=$AOM_CITY, miles=$AOM_WITHIN_MILES"
+    python harvest.py || { echo "❌ Python crashed"; exit 1; }
