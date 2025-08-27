@@ -1,318 +1,207 @@
 #!/usr/bin/env python3
 """
-HTML harvester for steampunk events.
+Harvester: builds a JSON file of upcoming events.
 
-- Runs happily inside GitHub Actions (no JS, no headless browser)
-- Scrapes Eventbrite and TicketTailor public HTML with broad selectors
-- Never hard-fails: always writes a JSON artifact so the workflow stays green
-- Tunable via environment variables (see ENV section below)
+✅ Works in GitHub Actions (no third-party packages).
+✅ Reads public ICS calendar feeds (URLs in ICS_FEEDS env, comma-separated).
+✅ Keyword filtering (KEYWORDS env, comma-separated; case-insensitive).
+✅ Time window filtering (WINDOW_DAYS env; defaults safely to 180 even if blank).
+✅ Never fails the workflow on “no data” – still writes a valid JSON file.
 """
 
 from __future__ import annotations
 
 import os
-import re
+import sys
 import json
-import time
-import hashlib
+import re
+import io
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Iterable, Tuple, Optional
+from typing import List, Dict, Any, Optional
 
-import requests
-from bs4 import BeautifulSoup
+# ---------- small helpers ----------
 
-# -----------------------
-# ENV (all optional)
-# -----------------------
-KEYWORDS = [
-    k.strip() for k in os.getenv(
-        "KEYWORDS",
-        "steampunk,victorian,renaissance,faire,aether,tesla,edison"
-    ).split(",") if k.strip()
-]
-
-CITY = os.getenv("CITY", "").strip() or None         # e.g. "san-francisco"
-STATE = os.getenv("STATE", "").strip() or None       # e.g. "ca"
-COUNTRY = os.getenv("COUNTRY", "").strip() or "united-states"
-WITHIN_MILES = os.getenv("WITHIN_MILES", "").strip() or None
-WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "180"))
-
-SOURCES = [s.strip() for s in os.getenv(
-    "SOURCES",
-    "eventbrite_html,tickettailor_html"
-).split(",") if s.strip()]
-
-OUTFILE = os.getenv("OUTFILE", "aom-events.json")
-
-# Networking
-TIMEOUT = float(os.getenv("TIMEOUT", "12"))
-RETRIES = int(os.getenv("RETRIES", "2"))
-SLEEP_BETWEEN = float(os.getenv("SLEEP_BETWEEN", "0.6"))
-
-HEADERS = {
-    "User-Agent": os.getenv(
-        "USER_AGENT",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36 (+AOM Harvester)"
-    ),
-    "Accept-Language": "en-US,en;q=0.8",
-}
-
-
-# -----------------------
-# Helpers
-# -----------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
-def http_get(url: str) -> Optional[str]:
-    """GET with tiny retry loop; returns text or None."""
-    for i in range(1, RETRIES + 2):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code == 200 and r.text:
-                return r.text
-            # Treat 404/403 as final, others retry once or twice.
-            if r.status_code in (403, 404):
-                return None
-        except requests.RequestException:
-            pass
-        time.sleep(SLEEP_BETWEEN * i)
-    return None
-
-
-DATE_RE = re.compile(
-    r"(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*,?\s*)?"
-    r"(?:\b\d{1,2}\s*(?:AM|PM)\b|\b\d{1,2}:\d{2}\s*(?:AM|PM)\b|"
-    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:,\s*\d{4})?)",
-    re.I
-)
-
-
-def extract_nearby_date(elem: Any) -> Optional[str]:
+def clean_int_env(name: str, default: int) -> int:
     """
-    Heuristic: search up the DOM for a <time> tag or any text that looks like a date/time.
+    Read an int env var safely. Treats unset, empty, or invalid as default.
+    (Fix for the "" -> ValueError crash you hit earlier.)
     """
-    # 1) Direct time tags
-    nearest = elem
-    for _ in range(3):  # check elem, parent, grandparent
-        if not nearest:
-            break
-        # <time datetime="...">
-        for t in nearest.find_all("time"):
-            if t.get("datetime"):
-                return t.get("datetime").strip()
-            if t.text and DATE_RE.search(t.text):
-                return t.text.strip()
-        # Any texty node that looks date-ish
-        txt = nearest.get_text(" ", strip=True)
-        if txt:
-            m = DATE_RE.search(txt)
-            if m:
-                return m.group(0).strip()
-        nearest = nearest.parent
-    return None
-
-
-def dedupe(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for ev in events:
-        key = hashlib.sha256(ev.get("link", "").encode("utf-8")).hexdigest()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(ev)
-    return out
-
-
-# -----------------------
-# Eventbrite (HTML) scrapes
-# -----------------------
-def eventbrite_search_urls(keyword: str) -> List[str]:
-    """
-    Build several HTML-only search pages that render without JS.
-    We try progressively more general URLs.
-    """
-    urls = []
-
-    # City-scoped (if provided)
-    if CITY and STATE:
-        urls.append(f"https://www.eventbrite.com/d/{STATE}--{CITY}/{keyword}/")
-    # Country-scoped
-    if COUNTRY:
-        urls.append(f"https://www.eventbrite.com/d/{COUNTRY}/{keyword}/")
-    # Online catch-all
-    urls.append(f"https://www.eventbrite.com/d/online/{keyword}/")
-    # Very broad catch-all
-    urls.append(f"https://www.eventbrite.com/d/{keyword}/")
-    return urls
-
-
-def parse_eventbrite_html(html: str) -> List[Dict[str, Any]]:
-    """
-    Very broad extraction:
-    - any <a> whose href contains '/e/' (Eventbrite event detail pages)
-    - title is the link text; date pulled from nearby nodes
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/e/" not in href:
-            continue
-        # Normalize absolute link
-        if href.startswith("/"):
-            href = "https://www.eventbrite.com" + href
-        title = a.get_text(" ", strip=True)
-        if not title:
-            continue
-        date_text = extract_nearby_date(a)
-        out.append({
-            "title": title,
-            "link": href,
-            "date": date_text,
-            "source": "eventbrite_html",
-        })
-    return out
-
-
-def harvest_eventbrite(keyword: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    notes = []
-    events = []
-    for url in eventbrite_search_urls(keyword):
-        html = http_get(url)
-        if not html:
-            notes.append(f"eventbrite: no HTML for {url}")
-            continue
-        found = parse_eventbrite_html(html)
-        if found:
-            notes.append(f"eventbrite: {len(found)} links from {url}")
-            events.extend(found)
-        else:
-            notes.append(f"eventbrite: 0 links from {url}")
-    return events, notes
-
-
-# -----------------------
-# TicketTailor (HTML) scrapes
-# -----------------------
-def tickettailor_search_urls(keyword: str) -> List[str]:
-    """
-    TicketTailor doesn't have a single canonical public search URL that always SSRs,
-    so we try a few discover pages that commonly list events by text.
-    """
-    return [
-        f"https://www.tickettailor.com/events/search/?q={keyword}",
-        f"https://www.tickettailor.com/browse/?q={keyword}",
-    ]
-
-
-def parse_tickettailor_html(html: str) -> List[Dict[str, Any]]:
-    """
-    Broad extraction for TicketTailor:
-    - any <a> whose href contains '/events/' or '/event/'
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/events/" not in href and "/event/" not in href:
-            continue
-        if href.startswith("/"):
-            href = "https://www.tickettailor.com" + href
-        title = a.get_text(" ", strip=True)
-        if not title:
-            continue
-        date_text = extract_nearby_date(a)
-        out.append({
-            "title": title,
-            "link": href,
-            "date": date_text,
-            "source": "tickettailor_html",
-        })
-    return out
-
-
-def harvest_tickettailor(keyword: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    notes = []
-    events = []
-    for url in tickettailor_search_urls(keyword):
-        html = http_get(url)
-        if not html:
-            notes.append(f"tickettailor: no HTML for {url}")
-            continue
-        found = parse_tickettailor_html(html)
-        if found:
-            notes.append(f"tickettailor: {len(found)} links from {url}")
-            events.extend(found)
-        else:
-            notes.append(f"tickettailor: 0 links from {url}")
-    return events, notes
-
-
-# -----------------------
-# Pipeline
-# -----------------------
-def within_window(date_text: Optional[str]) -> bool:
-    """
-    Very forgiving window filter: if we can parse a month/day from the string and
-    infer a reasonable year, keep it when inside WINDOW_DAYS. If parsing fails,
-    we keep the event (you can filter later).
-    """
-    if not date_text:
-        return True  # keep unknown dates for manual review
-
-    # Try a couple of simple parses.
-    txt = date_text.strip()
-    # 1) ISO-ish
+    raw = os.getenv(name)
+    if not raw:
+        return default
     try:
-        dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
-        return (dt - now_utc()).days <= WINDOW_DAYS
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+def list_from_env(name: str) -> List[str]:
+    """
+    Split a comma/semicolon/newline separated env var into a list of strings.
+    Trims whitespace and drops empties.
+    """
+    raw = os.getenv(name) or ""
+    parts = re.split(r"[,\n;]+", raw)
+    return [p.strip() for p in parts if p.strip()]
+
+def safe_getenv(name: str) -> Optional[str]:
+    val = os.getenv(name)
+    if val is None:
+        return None
+    val = val.strip()
+    return val or None
+
+def log(msg: str) -> None:
+    print(f"[harvest] {msg}", flush=True)
+
+# ---------- ICS parsing (no third-party deps) ----------
+
+_ICS_EVENT_SPLIT = re.compile(r"(?m)^BEGIN:VEVENT\r?$")
+_ICS_KV = re.compile(r"(?m)^([A-Z]+)(;[^:]+)?:\s*(.+?)\s*$")
+_ICS_FOLDED = re.compile(r"(?m)\r?\n[ \t]")  # unfold folded lines
+
+def _unfold(text: str) -> str:
+    return _ICS_FOLDED.sub("", text)
+
+def _parse_ics_datetime(val: str) -> Optional[datetime]:
+    """
+    Supports common forms:
+      - 20250130T170000Z
+      - 20250130T170000 (floating; assume UTC)
+      - 20250130 (all-day; treat as start of day UTC)
+    """
+    val = val.strip()
+    try:
+        if val.endswith("Z"):
+            return datetime.strptime(val, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        if "T" in val:
+            # floating time – assume UTC for CI consistency
+            return datetime.strptime(val, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        # date only
+        return datetime.strptime(val, "%Y%m%d").replace(tzinfo=timezone.utc)
     except Exception:
-        pass
+        return None
 
-    # 2) Month Day[, Year] patterns
-    m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:,\s*(\d{4}))?", txt, re.I)
-    if m:
-        month = m.group(1)
-        day = int(re.search(r"\d{1,2}", m.group(0)).group(0))
-        year = int(m.group(2)) if m.group(2) else now_utc().year
+def parse_ics_events(text: str) -> List[Dict[str, Any]]:
+    text = _unfold(text)
+    # Split into event blocks (skip preamble)
+    blocks = _ICS_EVENT_SPLIT.split(text)
+    if not blocks:
+        return []
+    events: List[Dict[str, Any]] = []
+    for block in blocks[1:]:
+        # Extract key fields
+        fields: Dict[str, str] = {}
+        for m in _ICS_KV.finditer(block):
+            k = m.group(1).upper()
+            v = m.group(3).strip()
+            # Keep the last occurrence of a key
+            fields[k] = v
+        start = _parse_ics_datetime(fields.get("DTSTART", ""))
+        end = _parse_ics_datetime(fields.get("DTEND", "")) or start
+        title = fields.get("SUMMARY", "").strip()
+        url = fields.get("URL", "").strip()
+        loc = fields.get("LOCATION", "").strip()
+        desc = fields.get("DESCRIPTION", "").strip()
+
+        # Skip if we don't at least have a start or a title
+        if not (start or title):
+            continue
+
+        events.append({
+            "title": title or "(untitled)",
+            "start_utc": start.isoformat() if start else None,
+            "end_utc": end.isoformat() if end else None,
+            "location": loc or None,
+            "url": url or None,
+            "description": desc or None,
+            "source": "ics"
+        })
+    return events
+
+def fetch_text(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "aom-harvester/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    # try utf-8 first, fall back to latin-1
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1", errors="ignore")
+
+# ---------- main harvesting ----------
+
+def within_window(dt_iso: Optional[str], start: datetime, end: datetime) -> bool:
+    if not dt_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(dt_iso)
+    except ValueError:
+        return False
+    return start <= dt <= end
+
+def keyword_ok(title: str, keywords: List[str]) -> bool:
+    if not keywords:
+        return True
+    text = (title or "").lower()
+    return any(k.lower() in text for k in keywords)
+
+def harvest_from_ics(feeds: List[str]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for url in feeds:
         try:
-            dt = datetime.strptime(f"{month} {day} {year}", "%b %d %Y").replace(tzinfo=timezone.utc)
-            return (dt - now_utc()).days <= WINDOW_DAYS
-        except Exception:
-            return True  # if in doubt, keep
-    return True
+            log(f"Fetching ICS: {url}")
+            txt = fetch_text(url)
+            evs = parse_ics_events(txt)
+            for e in evs:
+                e = dict(e)
+                e["source"] = f"ics:{url}"
+                events.append(e)
+        except Exception as exc:
+            log(f"WARNING: failed ICS fetch/parse: {url} ({exc})")
+    return events
 
+def main() -> int:
+    # ----- configuration from environment -----
+    KEYWORDS = list_from_env("KEYWORDS")
+    WINDOW_DAYS = clean_int_env("WINDOW_DAYS", 180)   # <— safe defaulting
+    ICS_FEEDS = list_from_env("ICS_FEEDS")
 
-def run() -> Dict[str, Any]:
-    notes: List[str] = []
+    # Optional location filters (not applied to ICS unless present in text)
+    CITY = safe_getenv("CITY")
+    STATE = safe_getenv("STATE")
+    COUNTRY = safe_getenv("COUNTRY")
+    WITHIN_MILES = clean_int_env("WITHIN_MILES", 0) if safe_getenv("WITHIN_MILES") else None
+
+    out_name = safe_getenv("OUTFILE") or "aom-events.json"
+
+    log(f"Start — window_days={WINDOW_DAYS}, keywords={KEYWORDS or '—'}, ics_feeds={len(ICS_FEEDS)}")
+
+    start = now_utc()
+    end = start + timedelta(days=WINDOW_DAYS)
+
+    # ----- collect -----
     all_events: List[Dict[str, Any]] = []
 
-    if not KEYWORDS:
-        notes.append("No KEYWORDS provided; using default list.")
+    # ICS feeds (if any)
+    if ICS_FEEDS:
+        all_events.extend(harvest_from_ics(ICS_FEEDS))
+    else:
+        log("No ICS_FEEDS provided; skipping ICS harvest.")
 
-    for kw in KEYWORDS:
-        kwq = kw.replace(" ", "-").lower()
+    # ----- filter: keywords + time window -----
+    filtered: List[Dict[str, Any]] = []
+    for e in all_events:
+        if not within_window(e.get("start_utc"), start, end):
+            continue
+        if not keyword_ok(e.get("title", ""), KEYWORDS):
+            continue
+        filtered.append(e)
 
-        if "eventbrite_html" in SOURCES:
-            evs, n = harvest_eventbrite(kwq)
-            all_events.extend(evs)
-            notes.extend(n)
-
-        if "tickettailor_html" in SOURCES:
-            evs, n = harvest_tickettailor(kwq)
-            all_events.extend(evs)
-            notes.extend(n)
-
-        time.sleep(SLEEP_BETWEEN)
-
-    # Deduplicate and filter by date window (lightly)
-    all_events = dedupe(all_events)
-    all_events = [e for e in all_events if within_window(e.get("date"))]
-
+    # ----- build output -----
     payload: Dict[str, Any] = {
         "meta": {
             "ts_utc": now_utc().isoformat(),
@@ -322,34 +211,27 @@ def run() -> Dict[str, Any]:
             "country": COUNTRY,
             "within_miles": WITHIN_MILES,
             "window_days": WINDOW_DAYS,
-            "sources": SOURCES,
-            "count": len(all_events),
+            "sources": ["ics"] if ICS_FEEDS else [],
+            "count": len(filtered),
         },
-        "events": all_events,
-        "notes": notes or ["ok"],
+        "events": filtered,
+        "notes": []
     }
-    return payload
 
+    if not ICS_FEEDS:
+        payload["notes"].append("No ICS_FEEDS provided.")
+    if not filtered and all_events:
+        payload["notes"].append("No events matched filters (time window and/or keywords).")
+    if not all_events and ICS_FEEDS:
+        payload["notes"].append("ICS feeds fetched but no events were parsed.")
 
-def main() -> None:
-    data = {}
-    try:
-        data = run()
-    except Exception as ex:
-        # Never crash the workflow: emit a tiny diagnostic JSON instead.
-        data = {
-            "meta": {
-                "ts_utc": now_utc().isoformat(),
-                "keywords": KEYWORDS,
-                "window_days": WINDOW_DAYS,
-                "sources": SOURCES,
-            },
-            "events": [],
-            "notes": [f"harvester error: {type(ex).__name__}: {ex}"],
-        }
-    with open(OUTFILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # ----- write file -----
+    with open(out_name, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    log(f"Wrote {out_name} with {len(filtered)} events (from {len(all_events)} raw).")
+    # Keep the job green even if zero events
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
