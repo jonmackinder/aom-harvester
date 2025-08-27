@@ -220,16 +220,12 @@ def write_md(path, events):
             f.write(f"| {title} | {start} | {city} | {url} | {org} |\n")
 
 def main():
-    # Inputs
-    keywords = read_env_list("KEYWORDS", [])  # e.g., ["steampunk","victorian","renaissance"]
+    # config from env (safe defaults)
     raw_days = os.getenv("WINDOW_DAYS", "").strip()
-window_days = int(raw_days) if raw_days.isdigit() else 180
-    start = now_utc()
-    end   = start + timedelta(days=window_days)
+    window_days = int(raw_days) if raw_days.isdigit() else 180
 
-    feeds = load_feeds()
-    all_events = []
-    errors = []
+    start = now_utc()
+    end = start + timedelta(days=window_days)
 
     for u in feeds:
         try:
