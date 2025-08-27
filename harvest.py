@@ -222,7 +222,8 @@ def write_md(path, events):
 def main():
     # Inputs
     keywords = read_env_list("KEYWORDS", [])  # e.g., ["steampunk","victorian","renaissance"]
-    window_days = int(os.getenv("WINDOW_DAYS", "180"))
+    raw_days = os.getenv("WINDOW_DAYS", "").strip()
+window_days = int(raw_days) if raw_days.isdigit() else 180
     start = now_utc()
     end   = start + timedelta(days=window_days)
 
