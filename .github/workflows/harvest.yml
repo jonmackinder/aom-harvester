@@ -4,49 +4,63 @@ on:
   workflow_dispatch:
     inputs:
       keywords:
-        description: "Comma keywords (e.g., steampunk,victorian,renaissance,faire)"
+        description: "Comma-separated keywords"
         required: false
+        default: "steampunk,victorian,renaissance,faire,aether,tesla,edison"
       city:
         description: "City (optional)"
         required: false
+        default: ""
       state:
-        description: "State/Region code (e.g., CA)"
+        description: "State/Region (optional)"
         required: false
+        default: ""
       country:
-        description: "Country (e.g., US)"
+        description: "Country (optional)"
         required: false
+        default: ""
       within_miles:
-        description: "Radius miles (optional, used textually)"
+        description: "Radius miles (optional)"
         required: false
+        default: ""
       window_days:
-        description: "Window (days ahead, default 180)"
+        description: "How many days out"
         required: false
+        default: "180"
       ics_feeds:
-        description: "Comma .ics URLs (optional)"
+        description: "One or more ICS feed URLs (comma or newline separated)"
         required: false
+        default: ""
 
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    env:
-      KEYWORDS: ${{ github.event.inputs.keywords }}
-      CITY: ${{ github.event.inputs.city }}
-      STATE: ${{ github.event.inputs.state }}
-      COUNTRY: ${{ github.event.inputs.country }}
-      WITHIN_MILES: ${{ github.event.inputs.within_miles }}
-      WINDOW_DAYS: ${{ github.event.inputs.window_days }}
-      ICS_FEEDS: ${{ github.event.inputs.ics_feeds }}
-
+    timeout-minutes: 5  # hard stop, so it can’t run forever
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml icalendar
+          pip install requests python-dateutil ics beautifulsoup4 lxml
 
       - name: Run harvester
-        run: python harvest.py
+        env:
+          KEYWORDS:       ${{ github.event.inputs.keywords }}
+          CITY:           ${{ github.event.inputs.city }}
+          STATE:          ${{ github.event.inputs.state }}
+          COUNTRY:        ${{ github.event.inputs.country }}
+          WITHIN_MILES:   ${{ github.event.inputs.within_miles }}
+          WINDOW_DAYS:    ${{ github.event.inputs.window_days }}
+          ICS_FEEDS:      ${{ github.event.inputs.ics_feeds }}
+        run: |
+          python harvest.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
