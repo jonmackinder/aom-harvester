@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Age of Machines — Events</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="wrap">
+    <h1>Age of Machines — Events</h1>
+    <p id="updated" class="muted">Loading…</p>
+
+    <div class="filters">
+      <input id="q" type="search" placeholder="Search title, city, org…" />
+      <input id="from" type="date" />
+      <input id="to" type="date" />
+      <button id="clear">Clear</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="notice" class="notice hidden"></div>
+    <ul id="list" class="cards"></ul>
+  </main>
+
+  <footer class="wrap muted">
+    <p>Sources used: <span id="sources">—</span></p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
