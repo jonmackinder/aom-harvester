@@ -50,5 +50,32 @@
   </main>
 
   <script src="app.js"></script>
+
+  <button id="sendToWorker">Send to Harvester</button>
+
+<script>
+document.getElementById("sendToWorker").onclick = async () => {
+  // Grab current merged events from the page’s JS
+  const events = window.currentEvents || []; // use whatever variable holds them
+
+  if (!events.length) {
+    alert("No events to send!");
+    return;
+  }
+
+  const res = await fetch("https://icy-snow-68a6.jonsarlendropbox.workers.dev/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: "hub",
+      note: "manual export from AOM Event Hub",
+      events
+    })
+  });
+
+  const result = await res.json().catch(() => ({}));
+  alert("Worker response: " + JSON.stringify(result));
+};
+</script>
 </body>
 </html>
