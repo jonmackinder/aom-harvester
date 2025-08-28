@@ -1,13 +1,18 @@
 name: AOM – Harvest & Publish
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      source_urls:
+        description: "Comma-separated event source URLs (any sites)"
+        required: false
+        default: ""
   schedule:
-    # every day at 07:05 UTC
-    - cron: "5 7 * * *"
+    - cron: "5 7 * * *"   # daily at 07:05 UTC
 
 permissions:
-  contents: write   # needed to commit snapshots + site data
+  contents: write
+  pages: read
 
 env:
   PYTHON_VERSION: "3.11"
@@ -15,9 +20,10 @@ env:
   CITY: ""
   STATE: ""
   COUNTRY: ""
-  KEYWORDS: ""      # e.g. "steampunk, victorian"
-  ICS_FEEDS: ""     # comma-separated .ics URLs
-
+  KEYWORDS: ""
+  ICS_FEEDS: ""
+  SOURCE_URLS: ${{ github.event.inputs.source_urls }}  # <-- read inputs
+  
 concurrency:
   group: aom-harvest
   cancel-in-progress: false
