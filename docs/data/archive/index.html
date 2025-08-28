@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AOM Event Hub – Raw Archive</title>
+<style>
+  :root { --bg:#121212; --card:#1b1b1b; --text:#e6e6e6; --muted:#a7a7a7; --accent:#f3c04d; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:28px 16px; text-align:center; }
+  h1 { margin:0 0 6px; font-size:1.6rem; }
+  .desc { color:var(--muted); }
+  main { max-width:960px; margin:0 auto; padding:0 16px 48px; }
+  .year { font-size:1.25rem; margin:24px 0 8px; color:var(--accent); }
+  .month { margin:10px 0 6px; color:#ddd; }
+  .card { background:var(--card); border-radius:10px; padding:12px 14px; margin:8px 0; }
+  a { color:#cfe3ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .row { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+  .row .meta { color:var(--muted); font-size:.92rem; }
+  .topbar { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; margin:12px 0 6px; }
+  .btn { background:#2a2a2a; color:#fff; border:1px solid #333; border-radius:8px; padding:8px 12px; cursor:pointer; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🗃️ AOM – Raw Event Snapshots</h1>
+    <div class="desc">Every time you publish, a raw JSON snapshot is saved here for forensics & rollback.</div>
+  </header>
+
+  <main>
+    <div class="topbar">
+      <div id="counter">Loading…</div>
+      <div>
+        <button class="btn" onclick="location.href='../../calendar.html'">← Back to Calendar</button>
+      </div>
+    </div>
+    <div id="list"></div>
+  </main>
+
+<script>
+/** CONFIG: set your owner/repo/branch once */
+const OWNER  = "jonmackinder";
+const REPO   = "aom-harvester";
+const BRANCH = "main";
+
+/** GitHub API helpers */
+const api = (path) => `https://api.github.com/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(BRANCH)}`;
+const raw = (path) => `https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/${path}`;
+
+/** Recursively walk docs/data/archive */
+async function listArchive() {
+  const root = "docs/data/archive";
+  const years = await fetch(api(root)).then(r=>r.json());
+  if (!Array.isArray(years)) throw new Error("Archive folder not found.");
+
+  const files = [];
+  for (const y of years.filter(x=>x.type==="dir")) {
+    const months = await fetch(api(`${root}/${y.name}`)).then(r=>r.json());
+    for (const m of months.filter(x=>x.type==="dir")) {
+      const items = await fetch(api(`${root}/${y.name}/${m.name}`)).then(r=>r.json());
+      for (const f of items.filter(x=>x.type==="file" && x.name.endsWith(".json"))) {
+        files.push({
+          year: y.name, month: m.name, name: f.name,
+          path: f.path, size: f.size, url: raw(f.path)
+        });
+      }
+    }
+  }
+  return files.sort((a,b)=> a.path.localeCompare(b.path)).reverse(); // newest first
+}
+
+/** Render list */
+function render(files) {
+  const byYM = new Map();
+  for (const f of files) {
+    const key = `${f.year}-${f.month}`;
+    if (!byYM.has(key)) byYM.set(key, []);
+    byYM.get(key).push(f);
+  }
+
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  document.getElementById("counter").textContent = `${files.length} snapshot${files.length!==1?"s":""}`;
+
+  const ymKeys = [...byYM.keys()].sort().reverse(); // newest first
+  let currentYear = null;
+  for (const key of ymKeys) {
+    const [year, month] = key.split("-");
+    if (year !== currentYear) {
+      currentYear = year;
+      const y = document.createElement("div");
+      y.className = "year";
+      y.textContent = year;
+      list.appendChild(y);
+    }
+    const m = document.createElement("div");
+    m.className = "month";
+    m.textContent = new Date(`${year}-${month}-01`).toLocaleString(undefined,{month:"long"});
+    list.appendChild(m);
+
+    for (const f of byYM.get(key)) {
+      const card = document.createElement("div"); card.className = "card";
+      const row = document.createElement("div"); row.className = "row";
+      const link = document.createElement("a");
+      link.href = f.url;
+      link.textContent = f.name;
+      link.download = f.name;
+
+      const meta = document.createElement("div"); meta.className = "meta";
+      meta.textContent = `• ${(f.size/1024).toFixed(1)} KB`;
+      row.appendChild(link);
+      row.appendChild(meta);
+      card.appendChild(row);
+      list.appendChild(card);
+    }
+  }
+}
+
+/** Go */
+listArchive().then(render).catch(err=>{
+  document.getElementById("counter").textContent = "Error loading archive";
+  document.getElementById("list").innerHTML = `<div class="card">❌ ${err.message}</div>`;
+});
+</script>
+</body>
+</html>
