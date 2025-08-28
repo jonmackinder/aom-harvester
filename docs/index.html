@@ -77,5 +77,31 @@ document.getElementById("sendToWorker").onclick = async () => {
   alert("Worker response: " + JSON.stringify(result));
 };
 </script>
+
+  <button id="sendBoth">🚀 Publish Clean + Archive Raw</button>
+
+<script>
+const WORKER_URL = "https://YOUR-WORKER-NAME.workers.dev"; // replace with your worker URL
+
+document.getElementById("sendBoth").onclick = async () => {
+  const clean = window.eventsClean || window.eventsData || [];
+  const raw   = window.eventsRaw   || [];
+
+  if (!clean.length && !raw.length) {
+    alert("No events loaded."); return;
+  }
+  try {
+    const res = await fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clean, raw })
+    });
+    const out = await res.json().catch(()=>({}));
+    alert(out.ok ? "✅ Published" : "❌ Failed: " + (out.error || "unknown"));
+  } catch (e) {
+    alert("❌ Error: " + e.message);
+  }
+};
+</script>
 </body>
 </html>
