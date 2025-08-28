@@ -1,75 +1,194 @@
-(async function () {
-  const $list = document.getElementById('list');
-  const $notice = document.getElementById('notice');
-  const $updated = document.getElementById('updated');
-  const $sources = document.getElementById('sources');
-  const $q = document.getElementById('q');
-  const $from = document.getElementById('from');
-  const $to = document.getElementById('to');
-  const $clear = document.getElementById('clear');
+// docs/app.js
 
-  // Load JSON produced by the harvester (written by the workflow below)
-  let data;
-  try {
-    const res = await fetch('data/events.json', { cache: 'no-store' });
-    data = await res.json();
-  } catch (e) {
-    $updated.textContent = 'Could not load events.json';
-    return;
+(function () {
+  const $events = document.getElementById('events');
+
+  // Candidate locations for the JSON (tries the first that succeeds)
+  const CANDIDATE_URLS = [
+    'data/events.json',          // <— our target (harvester writes here)
+    'events.json',               // fallback 1 (if you drop it at /docs/)
+    'aom-events.json'            // fallback 2 (legacy/artifact name)
+  ];
+
+  // --- helpers -------------------------------------------------------------
+
+  const by = (key, dir = 1) => (a, b) => (a[key] > b[key] ? dir : a[key] < b[key] ? -dir : 0);
+
+  function fmtDate(iso) {
+    if (!iso) return '';
+    try {
+      const d = new Date(iso);
+      return d.toLocaleString([], {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch { return iso; }
   }
 
-  const meta = data.meta || {};
-  const events = Array.isArray(data.events) ? data.events : [];
-  $updated.textContent = meta.ts_utc ? `Last updated: ${meta.ts_utc}` : 'No timestamp';
-  $sources.textContent = (meta.sources || []).join(', ') || '—';
-
-  if (!events.length) {
-    $notice.classList.remove('hidden');
-    $notice.innerHTML =
-      `No events harvested yet. As sources are added (ICS feeds or HTML scrapers), they will appear here automatically.`;
+  function monthKey(iso) {
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   }
 
-  const fmt = (s) => new Date(s).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  function esc(str = '') {
+    return String(str)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+  }
 
-  function render(list) {
-    $list.innerHTML = '';
-    list.forEach(ev => {
-      const li = document.createElement('li');
-      li.className = 'card';
-      const when = ev.start ? fmt(ev.start) : 'TBA';
-      const where = [ev.city, ev.state, ev.country].filter(Boolean).join(', ') || 'Online / TBA';
-      const org = ev.organizer || ev.source || '';
-      const link = ev.url ? `<a href="${ev.url}" target="_blank" rel="noopener">event link</a>` : '';
+  function matchesQuery(ev, q) {
+    if (!q) return true;
+    q = q.toLowerCase();
+    const bag = [
+      ev.title,
+      ev.city,
+      ev.state,
+      ev.country,
+      ev.venue,
+      ev.description
+    ].filter(Boolean).join(' ').toLowerCase();
+    return bag.includes(q);
+  }
 
-      li.innerHTML = `
-        <h3>${ev.title || 'Untitled'} ${ev.source ? `<span class="badge">${ev.source}</span>` : ''}</h3>
-        <div class="meta">${when} • ${where}${org ? ` • ${org}` : ''}</div>
-        <div>${ev.summary || ''}</div>
-        <div class="meta">${link}</div>
+  // Normalize a variety of event shapes into the one we render
+  function normalizeEvents(json) {
+    const raw = Array.isArray(json?.events) ? json.events : [];
+    return raw.map(e => ({
+      title: e.title || e.name || e.summary || 'Untitled event',
+      url: e.url || e.link || '#',
+      start: e.start_utc || e.start || e.startDate || e.start_time || e.dtstart,
+      end: e.end_utc || e.end || e.endDate || e.end_time || e.dtend,
+      city: e.city || e.location_city || e.city_name,
+      state: e.state || e.region || e.state_code,
+      country: e.country || e.country_code,
+      venue: e.venue || e.location || e.place,
+      source: e.source || e.provider || json?.meta?.sources?.join(', ')
+    })).filter(e => e.start); // must have a start time to sort/show
+  }
+
+  function renderControls(onFilter) {
+    const wrap = document.createElement('div');
+    wrap.style.maxWidth = '800px';
+    wrap.style.margin = '1rem auto';
+    wrap.style.display = 'flex';
+    wrap.style.gap = '0.5rem';
+    wrap.style.alignItems = 'center';
+    wrap.style.justifyContent = 'space-between';
+
+    wrap.innerHTML = `
+      <input id="q" type="search" placeholder="Filter by city, title, country…" 
+             style="flex:1; padding:.6rem .8rem; border-radius:8px; border:1px solid #333; background:#111; color:#eee;">
+      <button id="clear" style="padding:.6rem .9rem; border-radius:8px; border:1px solid #333; background:#222; color:#eee; cursor:pointer">
+        Clear
+      </button>
+    `;
+    document.body.insertBefore(wrap, $events.parentElement);
+
+    const q = wrap.querySelector('#q');
+    wrap.querySelector('#clear').onclick = () => { q.value = ''; onFilter(''); };
+    q.addEventListener('input', () => onFilter(q.value));
+  }
+
+  function renderEmpty(msg, note = '') {
+    $events.innerHTML = `
+      <div style="text-align:center; padding:1rem;">
+        <div style="font-weight:700; margin-bottom:.25rem;">${esc(msg)}</div>
+        ${note ? `<div style="opacity:.7;">${esc(note)}</div>` : ''}
+      </div>
+    `;
+  }
+
+  function render(events, meta = {}) {
+    if (!events.length) {
+      const note = (meta?.notes && meta.notes.join(' ')) || '';
+      renderEmpty('No upcoming events found.', note);
+      return;
+    }
+
+    // Sort by start ascending
+    events.sort(by('start', 1));
+
+    // Group by month
+    const groups = new Map();
+    for (const ev of events) {
+      const key = monthKey(ev.start);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(ev);
+    }
+
+    // Build HTML
+    let html = '';
+    for (const [key, list] of groups) {
+      const [y, m] = key.split('-');
+      const monthName = new Date(`${y}-${m}-01T00:00:00Z`)
+        .toLocaleString([], { month: 'long', year: 'numeric' });
+
+      html += `
+        <h2 style="margin:1.5rem 0 .75rem 0; color:#f2c14e; border-bottom:1px solid #333; padding-bottom:.25rem;">
+          ${esc(monthName)}
+        </h2>
       `;
-      $list.appendChild(li);
-    });
+
+      for (const e of list) {
+        const place = [e.city, e.state, e.country].filter(Boolean).join(', ');
+        html += `
+          <article style="padding:.75rem 0; border-bottom:1px dashed #333;">
+            <div style="font-weight:700; font-size:1.05rem; margin-bottom:.15rem;">
+              ${e.url && e.url !== '#'
+                ? `<a href="${esc(e.url)}" target="_blank" rel="noopener" style="color:#fff; text-decoration:none;">${esc(e.title)}</a>`
+                : esc(e.title)}
+            </div>
+            <div style="opacity:.9;">
+              ${esc(fmtDate(e.start))}${e.end ? ` – ${esc(fmtDate(e.end))}` : ''}${place ? ` • ${esc(place)}` : ''}
+            </div>
+            ${e.venue ? `<div style="opacity:.8;">Venue: ${esc(e.venue)}</div>` : ''}
+            ${e.source ? `<div style="opacity:.6; font-size:.9rem;">Source: ${esc(e.source)}</div>` : ''}
+          </article>
+        `;
+      }
+    }
+
+    $events.innerHTML = html;
   }
 
-  function applyFilters() {
-    const q = ($q.value || '').toLowerCase().trim();
-    const f = $from.value ? new Date($from.value) : null;
-    const t = $to.value ? new Date($to.value) : null;
-    const filtered = events.filter(ev => {
-      const hay = [
-        ev.title, ev.city, ev.state, ev.country, ev.organizer, ev.source, ev.summary
-      ].filter(Boolean).join(' ').toLowerCase();
-      const okQ = q ? hay.includes(q) : true;
-      const start = ev.start ? new Date(ev.start) : null;
-      const okFrom = f && start ? start >= f : true;
-      const okTo   = t && start ? start <= t : true;
-      return okQ && okFrom && okTo;
-    }).sort((a,b) => (a.start||'').localeCompare(b.start||''));
-    render(filtered);
+  async function fetchFirst(urls) {
+    for (const url of urls) {
+      try {
+        const r = await fetch(url, { cache: 'no-store' });
+        if (r.ok) return await r.json();
+      } catch (_) { /* try next */ }
+    }
+    throw new Error('No events JSON found at known locations.');
   }
 
-  $q.oninput = $from.onchange = $to.onchange = applyFilters;
-  $clear.onclick = () => { $q.value=''; $from.value=''; $to.value=''; applyFilters(); };
+  // --- boot ---------------------------------------------------------------
 
-  render(events);
+  (async function boot() {
+    try {
+      const json = await fetchFirst(CANDIDATE_URLS);
+      let events = normalizeEvents(json);
+
+      // Only keep future events (start >= now)
+      const now = Date.now();
+      events = events.filter(e => new Date(e.start).getTime() >= now);
+
+      // Controls
+      renderControls(q => {
+        const filtered = events.filter(e => matchesQuery(e, q));
+        render(filtered, json?.meta);
+      });
+
+      render(events, json?.meta);
+    } catch (err) {
+      console.error(err);
+      renderEmpty(
+        'Could not load events.',
+        'Looking for data/events.json (or a fallback). Once your harvester publishes, this will fill in automatically.'
+      );
+    }
+  })();
 })();
