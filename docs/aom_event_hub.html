@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AOM Event Hub — Sort · Dedupe · Export</title>
+<style>
+  :root{--bg:#0b0c10;--fg:#e8e8e8;--muted:#9aa0a6;--card:#13151a;--brand:#ffd166;--accent:#06d6a0;--danger:#ef476f;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,'Helvetica Neue',Arial}
+  header{padding:16px 20px;border-bottom:1px solid #1e2128;background:linear-gradient(180deg,#0c0e14,#0b0c10)}
+  h1{margin:0;font-size:20px;letter-spacing:.3px}
+  .wrap{padding:18px;max-width:1200px;margin:0 auto}
+  .flex{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .panel{background:var(--card);border:1px solid #1e2128;border-radius:10px;padding:14px}
+  .pill{border:1px solid #2a2f3a;padding:6px 10px;border-radius:999px;color:var(--muted);}
+  button{border:1px solid #2a2f3a;background:#161922;color:var(--fg);padding:8px 12px;border-radius:8px;cursor:pointer}
+  button:hover{border-color:#3a4150}
+  button.primary{background:var(--brand);color:#111;border-color:#e3be4d}
+  button.accent{background:var(--accent);color:#111;border-color:#0cbf8a}
+  button.danger{background:var(--danger);color:#fff;border-color:#d33a5f}
+  .grid{display:grid;grid-template-columns: 2fr 1fr 1.1fr 1fr 1fr 2.2fr; gap:8px; align-items:center}
+  .grid.header{font-weight:600;color:#cfd3da}
+  .row{padding:10px;border-bottom:1px solid #1e2128}
+  .row:nth-child(even){background:#12141a}
+  .muted{color:var(--muted)}
+  #drop{border:2px dashed #2a2f3a;border-radius:12px;padding:20px;text-align:center}
+  #drop.drag{border-color:var(--accent);background:#0f1720}
+  code{background:#0f1220;border:1px solid #20253a;border-radius:6px;padding:2px 6px}
+  details{border:1px solid #232736;border-radius:10px;padding:10px;margin-top:10px}
+  summary{cursor:pointer;font-weight:600}
+  .src-tag{font-size:12px;background:#0f1220;border:1px solid #2a2f3a;border-radius:6px;padding:2px 6px}
+  .right{justify-content:flex-end}
+  .spacer{flex:1}
+  a{color:#8fd3ff;text-decoration:none}
+  a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<header class="flex">
+  <h1>🛠️ AOM Event Hub</h1>
+  <span class="pill">Drop JSON from sources → Sort → Dedupe → Export</span>
+  <div class="spacer"></div>
+  <button id="btnClear" class="danger">Clear All</button>
+</header>
+
+<div class="wrap">
+  <div id="drop" class="panel">
+    <strong>Drop one or more <code>.json</code> files here</strong> (from the bookmarklet), or
+    <label style="cursor:pointer;color:#8fd3ff">
+      choose files
+      <input id="fileInput" type="file" accept="application/json" multiple style="display:none">
+    </label>.
+    <div class="muted" style="margin-top:8px">Each file may contain multiple events. We’ll merge them by source.</div>
+  </div>
+
+  <div class="panel flex" style="margin-top:14px">
+    <div class="flex" style="gap:8px">
+      <button class="primary" id="btnSortDate">Sort by Start Date</button>
+      <button id="btnSortName">Sort by Name</button>
+      <button id="btnSortCountry">Sort by Country</button>
+      <button id="btnSortState">Sort by State/Region</button>
+      <button id="btnSortSource">Sort by Source</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="flex" style="gap:8px">
+      <button class="accent" id="btnDedupe">Deduplicate</button>
+      <button id="btnExportCSV">Export CSV</button>
+      <button id="btnExportAOM">Export AOM Text</button>
+      <button id="btnExportJSON">Export JSON</button>
+    </div>
+  </div>
+
+  <div class="panel" id="sourcesPanel">
+    <div class="flex">
+      <strong>Sources</strong>
+      <div class="spacer"></div>
+      <span class="muted" id="metaCount">0 events</span>
+    </div>
+    <div id="sources" class="flex" style="gap:8px;margin-top:10px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="grid header">
+      <div>Event</div><div>Dates</div><div>Start</div><div>Country</div><div>State</div><div>Location</div>
+    </div>
+    <div id="list"></div>
+  </div>
+
+  <details>
+    <summary>How to harvest (FanCons)</summary>
+    <p>Use this bookmarklet on a FanCons schedule page. It will download a JSON file ready to drop here.</p>
+    <pre id="bm" style="white-space:pre-wrap;user-select:all;border:1px solid #222;padding:8px;border-radius:8px;background:#0f1220;color:#cfe6ff"></pre>
+  </details>
+</div>
+
+<script>
+// State
+let EVENTS = []; // master list
+let FILTER = null; // active source filter
+
+const $ = (sel, el=document)=>el.querySelector(sel);
+const $$ = (sel, el=document)=>Array.from(el.querySelectorAll(sel));
+
+function updateMeta(){
+  $('#metaCount').textContent = EVENTS.length + ' events';
+  // sources pills
+  const panel = $('#sources');
+  panel.innerHTML = '';
+  const sources = [...new Set(EVENTS.map(e=>e.source?.site + ' — ' + (e.source?.source_url||'')))];
+  const allBtn = document.createElement('button');
+  allBtn.textContent = 'All sources';
+  allBtn.className = 'src-tag';
+  allBtn.onclick = ()=>{ FILTER=null; render() };
+  panel.appendChild(allBtn);
+  sources.forEach(s=>{
+    const btn = document.createElement('button');
+    btn.textContent = s;
+    btn.className = 'src-tag';
+    btn.onclick = ()=>{ FILTER=s; render() };
+    panel.appendChild(btn);
+  });
+}
+
+function normalizeStr(s){ return (s||'').toString().trim(); }
+function keyFor(e){
+  return [normalizeStr(e.name).toLowerCase(), e.start_date_iso||'', (e.country||'').toLowerCase(), (e.state||'').toLowerCase()].join(' | ');
+}
+
+function dedupe(){
+  const map = new Map();
+  for(const e of EVENTS){
+    const k = keyFor(e);
+    if(!map.has(k)) map.set(k, e);
+  }
+  EVENTS = [...map.values()];
+  render();
+}
+
+function render(list=EVENTS){
+  let rows = list;
+  if(FILTER){
+    rows = rows.filter(e => (e.source?.site + ' — ' + (e.source?.source_url||'')) === FILTER);
+  }
+  const el = $('#list');
+  el.innerHTML = '';
+  for(const e of rows){
+    const row = document.createElement('div');
+    row.className = 'row grid';
+    row.innerHTML = `
+      <div><a href="${e.url||'#'}" target="_blank" rel="noopener">${escapeHTML(e.name||'(no name)')}</a><div class="muted" style="font-size:12px">${escapeHTML(e.source?.site||'')} — ${escapeHTML(e.source?.source_url||'')}</div></div>
+      <div>${escapeHTML(e.dates_text||'')}</div>
+      <div>${escapeHTML(e.start_date_iso||'')}</div>
+      <div>${escapeHTML(e.country||'')}</div>
+      <div>${escapeHTML(e.state||'')}</div>
+      <div>${escapeHTML(e.location_text||'')}</div>
+    `;
+    el.appendChild(row);
+  }
+  updateMeta();
+}
+
+function escapeHTML(s){ return (s||'').replace(/[&<>"]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+// Sorting
+function sortBy(fn){
+  EVENTS.sort((a,b)=>{
+    const ax = fn(a)||''; const bx = fn(b)||'';
+    return ax<bx?-1:ax>bx?1:0;
+  });
+  render();
+}
+
+$('#btnSortDate').onclick = ()=>sortBy(e=>e.start_date_iso||'');
+$('#btnSortName').onclick = ()=>sortBy(e=>(e.name||'').toLowerCase());
+$('#btnSortCountry').onclick = ()=>sortBy(e=>(e.country||'').toLowerCase());
+$('#btnSortState').onclick = ()=>sortBy(e=>(e.state||'').toLowerCase());
+$('#btnSortSource').onclick = ()=>sortBy(e=> (e.source?.site||'') + (e.source?.source_url||''));
+
+$('#btnDedupe').onclick = dedupe;
+
+// Exports
+function download(filename, content, mime='text/plain'){
+  const blob = new Blob([content], {type: mime});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$('#btnExportCSV').onclick = ()=>{
+  const header = ['Name','StartISO','EndISO','DatesText','City','State','Country','Location','URL','SourceSite','SourceURL','ScrapedAt'];
+  const lines = [header.join(',')];
+  for(const e of EVENTS){
+    const q = x => '"' + ( (x??'').toString().replace(/"/g,'""') ) + '"';
+    lines.push([e.name,e.start_date_iso||'',e.end_date_iso||'',e.dates_text||'',e.city||'',e.state||'',e.country||'',e.location_text||'',e.url||'',e.source?.site||'',e.source?.source_url||'',e.source?.scraped_at||''].map(q).join(','));
+  }
+  download('aom_events.csv', lines.join('\n'), 'text/csv');
+};
+
+$('#btnExportJSON').onclick = ()=>{
+  download('aom_events.json', JSON.stringify(EVENTS, null, 2), 'application/json');
+};
+
+$('#btnExportAOM').onclick = ()=>{
+  // AOM text format (simple, line-based, with attribution footer)
+  const lines = [];
+  const bySource = new Map();
+  for(const e of EVENTS){
+    lines.push(`• ${e.name} — ${e.dates_text||e.start_date_iso||''} — ${e.location_text||[e.city,e.state,e.country].filter(Boolean).join(', ')} — ${e.url||''}`);
+    const src = (e.source?.site||'Unknown') + ' | ' + (e.source?.source_url||'');
+    if(!bySource.has(src)) bySource.set(src, 0);
+    bySource.set(src, bySource.get(src)+1);
+  }
+  lines.push('\nAcknowledgments:');
+  for(const [src, count] of bySource.entries()){
+    lines.push(`  · ${src} (${count} events)`);
+  }
+  download('aom_events.txt', lines.join('\n'), 'text/plain');
+};
+
+// File handling (drop/upload)
+const drop = $('#drop');
+const fileInput = $('#fileInput');
+
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,(e)=>{e.preventDefault(); drop.classList.add('drag');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,(e)=>{e.preventDefault(); drop.classList.remove('drag');}));
+drop.addEventListener('drop', async (e)=>{
+  const files = [...e.dataTransfer.files];
+  await handleFiles(files);
+});
+fileInput.addEventListener('change', async (e)=>{
+  await handleFiles([...e.target.files]);
+  fileInput.value = '';
+});
+
+async function handleFiles(files){
+  for(const f of files){
+    try{
+      const txt = await f.text();
+      const arr = JSON.parse(txt);
+      if(Array.isArray(arr)){
+        EVENTS = EVENTS.concat(arr);
+      }
+    }catch(err){
+      console.error('Failed to parse', f.name, err);
+    }
+  }
+  render();
+}
+
+$('#btnClear').onclick = ()=>{
+  EVENTS = [];
+  FILTER = null;
+  render();
+};
+
+// ---- Embed the FanCons bookmarklet code so user can copy it easily ----
+const bookmarklet = `(function(){function h(t){return t.replace(/\\s+/g,' ').trim()}function monIndex(m){const arr=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];return arr.indexOf(m.slice(0,3).toLowerCase())}function parseDateRange(s){s=h(s||'');const re=/([A-Za-z]{3,9})\\.?\\s*(\\d{1,2})?(?:\\s*[-–]\\s*([A-Za-z]{3,9})?\\.?\\s*(\\d{1,2}))?,?\\s*(\\d{4})/;const m=re.exec(s);if(!m)return{startISO:'',endISO:''};let[,m1,d1,m2,d2,y]=m;const mi1=monIndex(m1);const mi2=m2?monIndex(m2):mi1;if(mi1<0||mi2<0)return{startISO:'',endISO:''};const sd=Number(d1||1),ed=Number(d2||d1||1);const start=new Date(Number(y),mi1,sd);const end=new Date(Number(y),mi2,ed);return{startISO:isNaN(start)?'':start.toISOString().slice(0,10),endISO:isNaN(end)?'':end.toISOString().slice(0,10)}}function $(s,e=document){return e.querySelector(s)}function $all(s,e=document){return Array.from(e.querySelectorAll(s))}const url=location.href;const site='FanCons';const now=new Date().toISOString();const tbl=document.querySelector('table');if(!tbl){alert('No table found on this page.');return}const body=tbl.tBodies[0]||tbl;const rows=$all('tr',body).filter(r=>r.cells.length>=3);const out=[];for(const r of rows){const cells=[...r.cells].map(td=>h(td.textContent));const a=$('a',r);const name=a?a.textContent.trim():cells[1]||cells[0];const link=a?a.href:url;const dates=cells[0]||'';const loc=cells[2]||cells[1]||'';const city=(loc.split(',')[0]||'').trim();const rest=(loc.split(',').slice(1).join(',').trim());let state='';let country='';if(rest){const parts=rest.split(',').map(h); if(parts.length>1){state=parts.slice(0,-1).join(', ');country=parts[parts.length-1]}else{country=rest}}const {startISO,endISO}=parseDateRange(dates);out.push({name,dates_text:dates,start_date_iso:startISO,end_date_iso:endISO,city,state,country,location_text:loc,url:link,source:{site,source_url:url,scraped_at:now}})}const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);const slug=(document.title||'fancons').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');a.download=slug+'.json';a.click();URL.revokeObjectURL(a.href);alert('Exported '+out.length+' events to JSON. Drop that file into the AOM Event Hub.');})();`;
+const bmHref = 'javascript:' + encodeURIComponent(bookmarklet);
+const codeBlock = `javascript:${bookmarklet}`;
+document.getElementById('bm').textContent = codeBlock;
+</script>
+</body>
+</html>
