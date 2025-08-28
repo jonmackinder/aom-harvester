@@ -1,0 +1,26 @@
+{
+  "meta": { "sources": ["sample"], "notes": ["sample data"] },
+  "events": [
+    {
+      "title": "Steam & Brass Expo",
+      "url": "https://example.com/steam-brass",
+      "start": "2025-09-12T18:00:00Z",
+      "end": "2025-09-12T23:00:00Z",
+      "city": "San Diego",
+      "state": "CA",
+      "country": "US",
+      "venue": "Gaslamp Quarter",
+      "source": "sample"
+    },
+    {
+      "title": "Aether Masquerade Ball",
+      "url": "https://example.com/aether-ball",
+      "start": "2025-10-03T02:00:00Z",
+      "city": "Portland",
+      "state": "OR",
+      "country": "US",
+      "venue": "Guild Hall",
+      "source": "sample"
+    }
+  ]
+}
