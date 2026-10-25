@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "ts_utc": "2026-10-25T12:31:21.791175+00:00",
+    "keywords": [
+      "steampunk",
+      "victorian",
+      "renaissance",
+      "faire",
+      "aether",
+      "tesla",
+      "edison"
+    ],
+    "city": null,
+    "state": null,
+    "country": null,
+    "within_miles": null,
+    "window_days": 180,
+    "sources": [
+      "eventbrite_html",
+      "tickettailor_html"
+    ],
+    "count": 0
+  },
+  "events": [],
+  "notes": []
+}
